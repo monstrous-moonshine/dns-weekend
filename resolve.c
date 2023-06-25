@@ -1,0 +1,116 @@
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#define TYPE_A 1
+#define CLASS_IN 1
+
+static void die(const char *msg) {
+    perror(msg);
+    exit(1);
+}
+
+struct dns_header {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t num_questions;
+    uint16_t num_answers;
+    uint16_t num_authorities;
+    uint16_t num_additionals;
+};
+
+struct dns_question {
+    uint16_t type_;
+    uint16_t class_;
+};
+
+static_assert(sizeof(struct dns_header) == 12, "wrong size");
+static_assert(sizeof(struct dns_question) == 4, "wrong size");
+
+static char *encode_dns_name(const char *domain_name) {
+    int encoded_len = 0;
+    {
+        char *_domain_name = strdup(domain_name);
+        char *tok = strtok(_domain_name, ".");
+        while (tok) {
+            encoded_len += 1 + strlen(tok);
+            tok = strtok(NULL, ".");
+        }
+        free(_domain_name);
+        encoded_len += 1; // terminating NULL
+    }
+    char *out = malloc(encoded_len);
+    if (!out) die("malloc");
+    {
+        char *_domain_name = strdup(domain_name);
+        char *tok = strtok(_domain_name, ".");
+        char *ptr = out;
+        while (tok) {
+            int len = strlen(tok);
+            ptr[0] = len;
+            memcpy(ptr + 1, tok, len);
+            ptr += 1 + len;
+            tok = strtok(NULL, ".");
+        }
+        free(_domain_name);
+        ptr[0] = '\0';
+    }
+    return out;
+}
+
+static char *build_query(const char *domain_name, int record_type, int *query_size) {
+    char *name = encode_dns_name(domain_name);
+    int name_len = strlen(name);
+    uint16_t id = 0x8298;
+    uint16_t RECURSION_DESIRED = 1 << 8;
+    struct dns_header header = {
+        .id = htons(id),
+        .flags = htons(RECURSION_DESIRED),
+        .num_questions = htons(1),
+    };
+    struct dns_question question = {
+        .type_ = htons(record_type),
+        .class_ = htons(CLASS_IN),
+    };
+    int size = sizeof header + strlen(name) + 1 + sizeof question;
+    char *out = malloc(size);
+    if (!out) die("malloc");
+    char *ptr = out;
+    memcpy(ptr, &header, sizeof header);
+    ptr += sizeof header;
+    strcpy(ptr, name);
+    ptr += name_len + 1;
+    memcpy(ptr, &question, sizeof question);
+    free(name);
+    *query_size = size;
+    return out;
+}
+
+int main() {
+    char reply_buf[1024];
+    int query_size;
+    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd == -1)
+        die("socket");
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(53),
+    };
+    if (inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr) != 1) {
+        fprintf(stderr, "ERROR: can't convert address\n");
+        exit(1);
+    }
+    char *query = build_query("www.example.com", TYPE_A, &query_size);
+    if (sendto(sock_fd, query, query_size, 0, (const struct sockaddr *)&addr, sizeof addr) == -1)
+        die("sendto");
+    if (recvfrom(sock_fd, reply_buf, sizeof reply_buf, 0, NULL, NULL) == -1)
+        die("recvfrom");
+    free(query);
+    close(sock_fd);
+}
