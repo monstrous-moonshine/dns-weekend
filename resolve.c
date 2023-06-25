@@ -16,6 +16,11 @@ static void die(const char *msg) {
     exit(1);
 }
 
+typedef struct {
+    uint16_t len;
+    char *data;
+} String;
+
 struct dns_header {
     uint16_t id;
     uint16_t flags;
@@ -30,8 +35,20 @@ struct dns_question {
     uint16_t class_;
 };
 
+struct dns_record {
+    uint16_t type_;
+    uint16_t class_;
+    uint32_t ttl;
+    union {
+        uint16_t data_len;
+        String data;
+    };
+};
+
+static_assert(sizeof(String) == 16, "wrong size");
 static_assert(sizeof(struct dns_header) == 12, "wrong size");
 static_assert(sizeof(struct dns_question) == 4, "wrong size");
+static_assert(sizeof(struct dns_record) == 24, "wrong size");
 
 static char *encode_dns_name(const char *domain_name) {
     int encoded_len = 0;
@@ -64,9 +81,34 @@ static char *encode_dns_name(const char *domain_name) {
     return out;
 }
 
+static char *decode_dns_name(int sock_fd) {
+    char *out = NULL;
+    int prev_len = 0;
+    uint8_t field_len = 0;
+    if (recvfrom(sock_fd, &field_len, 1, 0, NULL, NULL) == -1)
+        die("recvfrom");
+    while (field_len != 0) {
+        if ((field_len & 0xc0) == 0xc0) {
+            uint8_t next_byte;
+            if (recvfrom(sock_fd, &next_byte, 1, 0, NULL, NULL) == -1)
+                die("recvfrom");
+            uint16_t ptr = (next_byte << 8) | (field_len & 0x3f);
+        } else {
+            out = realloc(out, prev_len + field_len + 1);
+            if (!out) die("malloc");
+            if (recvfrom(sock_fd, &out[prev_len], field_len, 0, NULL, NULL) == -1)
+                die("recvfrom");
+            out[prev_len + field_len] = '.';
+            prev_len += field_len + 1;
+        }
+        if (recvfrom(sock_fd, &field_len, 1, 0, NULL, NULL) == -1)
+            die("recvfrom");
+    }
+    out[prev_len - 1] = '\0';
+    return out;
+}
+
 static char *build_query(const char *domain_name, int record_type, int *query_size) {
-    char *name = encode_dns_name(domain_name);
-    int name_len = strlen(name);
     uint16_t id = 0x8298;
     uint16_t RECURSION_DESIRED = 1 << 8;
     struct dns_header header = {
@@ -78,17 +120,64 @@ static char *build_query(const char *domain_name, int record_type, int *query_si
         .type_ = htons(record_type),
         .class_ = htons(CLASS_IN),
     };
-    int size = sizeof header + strlen(name) + 1 + sizeof question;
+    char *name = encode_dns_name(domain_name);
+    int name_len = strlen(name) + 1;
+    int size = sizeof header + name_len + sizeof question;
     char *out = malloc(size);
     if (!out) die("malloc");
     char *ptr = out;
     memcpy(ptr, &header, sizeof header);
     ptr += sizeof header;
     strcpy(ptr, name);
-    ptr += name_len + 1;
+    ptr += name_len;
     memcpy(ptr, &question, sizeof question);
     free(name);
     *query_size = size;
+    return out;
+}
+
+static struct dns_header *parse_header(int sock_fd) {
+    struct dns_header *out = malloc(sizeof *out);
+    if (!out) die("malloc");
+    if (recvfrom(sock_fd, out, sizeof *out, 0, NULL, NULL) == -1)
+        die("recvfrom");
+    *out = (struct dns_header){
+        .id = ntohs(out->id),
+        .flags = ntohs(out->flags),
+        .num_questions = ntohs(out->num_questions),
+        .num_answers = ntohs(out->num_answers),
+        .num_authorities = ntohs(out->num_authorities),
+        .num_additionals = ntohs(out->num_additionals),
+    };
+    return out;
+}
+
+static struct dns_question *parse_question(int sock_fd) {
+    struct dns_question *out = malloc(sizeof *out);
+    if (!out) die("malloc");
+    if (recvfrom(sock_fd, out, sizeof *out, 0, NULL, NULL) == -1)
+        die("recvfrom");
+    *out = (struct dns_question){
+        .type_ = ntohs(out->type_),
+        .class_ = ntohs(out->class_),
+    };
+    return out;
+}
+
+static struct dns_record *parse_record(int sock_fd) {
+    char *name = decode_dns_name(sock_fd);
+    struct dns_record *out = malloc(sizeof *out);
+    if (!out) die("malloc");
+    *out = (struct dns_record){
+        .type_ = ntohs(out->type_),
+        .class_ = ntohs(out->class_),
+        .ttl = ntohl(out->ttl),
+        .data.len = ntohs(out->data_len),
+    };
+    out->data.data = malloc(out->data.len);
+    if (!out->data.data) die("malloc");
+    if (recvfrom(sock_fd, out->data.data, out->data.len, 0, NULL, NULL) == -1)
+        die("recvfrom");
     return out;
 }
 
