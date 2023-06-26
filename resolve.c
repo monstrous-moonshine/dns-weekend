@@ -10,6 +10,7 @@
 
 #define TYPE_A 1
 #define CLASS_IN 1
+#define DNS_PORT 53
 
 static void die(const char *msg) {
     perror(msg);
@@ -20,6 +21,11 @@ typedef struct {
     uint16_t len;
     char *data;
 } String;
+
+typedef struct {
+    uint16_t pos;
+    char *data;
+} Stream;
 
 struct dns_header {
     uint16_t id;
@@ -33,6 +39,7 @@ struct dns_header {
 struct dns_question {
     uint16_t type_;
     uint16_t class_;
+    const char *name;
 };
 
 struct dns_record {
@@ -43,14 +50,34 @@ struct dns_record {
         uint16_t data_len;
         String data;
     };
+    const char *name;
 };
 
 static_assert(sizeof(String) == 16, "wrong size");
+static_assert(sizeof(Stream) == 16, "wrong size");
 static_assert(sizeof(struct dns_header) == 12, "wrong size");
-static_assert(sizeof(struct dns_question) == 4, "wrong size");
-static_assert(sizeof(struct dns_record) == 24, "wrong size");
+static_assert(sizeof(struct dns_question) == 16, "wrong size");
+static_assert(sizeof(struct dns_record) == 32, "wrong size");
 
-static char *encode_dns_name(const char *domain_name) {
+static void read_stream(void *dst, Stream *src, size_t n) {
+    memcpy(dst, src->data + src->pos, n);
+    src->pos += n;
+}
+
+static void write_stream(Stream *dst, const void *src, size_t n) {
+    memcpy(dst->data + dst->pos, src, n);
+    dst->pos += n;
+}
+
+static uint16_t tell_stream(const Stream *stream) {
+    return stream->pos;
+}
+
+static void seek_stream(Stream *stream, uint16_t pos) {
+    stream->pos = pos;
+}
+
+static const char *encode_dns_name(const char *domain_name) {
     int encoded_len = 0;
     {
         char *_domain_name = strdup(domain_name);
@@ -81,66 +108,79 @@ static char *encode_dns_name(const char *domain_name) {
     return out;
 }
 
-static char *decode_dns_name(int sock_fd) {
+static const char *decode_dns_name(Stream *);
+
+static const char *decode_compressed_name(Stream *stream, uint8_t field_len) {
+    uint8_t next_byte;
+    read_stream(&next_byte, stream, 1);
+    uint16_t ptr = ((field_len & 0x3f) << 8) | next_byte;
+    uint16_t cur = tell_stream(stream);
+    seek_stream(stream, ptr);
+    const char *out = decode_dns_name(stream);
+    seek_stream(stream, cur);
+    return out;
+}
+
+static const char *decode_dns_name(Stream *stream) {
     char *out = NULL;
     int prev_len = 0;
-    uint8_t field_len = 0;
-    if (recvfrom(sock_fd, &field_len, 1, 0, NULL, NULL) == -1)
-        die("recvfrom");
+    uint8_t field_len;
+    read_stream(&field_len, stream, 1);
     while (field_len != 0) {
-        if ((field_len & 0xc0) == 0xc0) {
-            uint8_t next_byte;
-            if (recvfrom(sock_fd, &next_byte, 1, 0, NULL, NULL) == -1)
-                die("recvfrom");
-            uint16_t ptr = (next_byte << 8) | (field_len & 0x3f);
+        if ((field_len & 0xc0) != 0) {
+            const char *res = decode_compressed_name(stream, field_len);
+            int res_len = strlen(res);
+            out = realloc(out, prev_len + res_len + 1);
+            if (!out) die("malloc");
+            memcpy(&out[prev_len], res, res_len);
+            out[prev_len + res_len] = '.';
+            prev_len += res_len + 1;
+            free((void *)res);
+            break;
         } else {
             out = realloc(out, prev_len + field_len + 1);
             if (!out) die("malloc");
-            if (recvfrom(sock_fd, &out[prev_len], field_len, 0, NULL, NULL) == -1)
-                die("recvfrom");
+            read_stream(&out[prev_len], stream, field_len);
             out[prev_len + field_len] = '.';
             prev_len += field_len + 1;
         }
-        if (recvfrom(sock_fd, &field_len, 1, 0, NULL, NULL) == -1)
-            die("recvfrom");
+        read_stream(&field_len, stream, 1);
     }
     out[prev_len - 1] = '\0';
     return out;
 }
 
-static char *build_query(const char *domain_name, int record_type, int *query_size) {
+static const char *build_query(const char *domain_name, int record_type, int *query_size) {
+    /* TODO: make this random */
     uint16_t id = 0x8298;
-    uint16_t RECURSION_DESIRED = 1 << 8;
+    uint16_t flags = 1 << 8;
     struct dns_header header = {
         .id = htons(id),
-        .flags = htons(RECURSION_DESIRED),
+        .flags = htons(flags),
         .num_questions = htons(1),
     };
     struct dns_question question = {
         .type_ = htons(record_type),
         .class_ = htons(CLASS_IN),
     };
-    char *name = encode_dns_name(domain_name);
+    const char *name = encode_dns_name(domain_name);
     int name_len = strlen(name) + 1;
-    int size = sizeof header + name_len + sizeof question;
+    int size = sizeof header + name_len + 4;
     char *out = malloc(size);
     if (!out) die("malloc");
-    char *ptr = out;
-    memcpy(ptr, &header, sizeof header);
-    ptr += sizeof header;
-    strcpy(ptr, name);
-    ptr += name_len;
-    memcpy(ptr, &question, sizeof question);
-    free(name);
+    Stream stream = { .pos = 0, .data = out };
+    write_stream(&stream, &header, sizeof header);
+    write_stream(&stream, name, name_len);
+    write_stream(&stream, &question, 4);
+    free((void *)name);
     *query_size = size;
     return out;
 }
 
-static struct dns_header *parse_header(int sock_fd) {
+static const struct dns_header *parse_header(Stream *stream) {
     struct dns_header *out = malloc(sizeof *out);
     if (!out) die("malloc");
-    if (recvfrom(sock_fd, out, sizeof *out, 0, NULL, NULL) == -1)
-        die("recvfrom");
+    read_stream(out, stream, sizeof *out);
     *out = (struct dns_header){
         .id = ntohs(out->id),
         .flags = ntohs(out->flags),
@@ -152,54 +192,115 @@ static struct dns_header *parse_header(int sock_fd) {
     return out;
 }
 
-static struct dns_question *parse_question(int sock_fd) {
+static const struct dns_question *parse_question(Stream *stream) {
+    const char *name = decode_dns_name(stream);
     struct dns_question *out = malloc(sizeof *out);
     if (!out) die("malloc");
-    if (recvfrom(sock_fd, out, sizeof *out, 0, NULL, NULL) == -1)
-        die("recvfrom");
+    read_stream(out, stream, 4);
     *out = (struct dns_question){
         .type_ = ntohs(out->type_),
         .class_ = ntohs(out->class_),
+        .name = name,
     };
     return out;
 }
 
-static struct dns_record *parse_record(int sock_fd) {
-    char *name = decode_dns_name(sock_fd);
+static const struct dns_record *parse_record(Stream *stream) {
+    const char *name = decode_dns_name(stream);
     struct dns_record *out = malloc(sizeof *out);
     if (!out) die("malloc");
+    read_stream(out, stream, 10);
     *out = (struct dns_record){
         .type_ = ntohs(out->type_),
         .class_ = ntohs(out->class_),
         .ttl = ntohl(out->ttl),
         .data.len = ntohs(out->data_len),
+        .name = name,
     };
     out->data.data = malloc(out->data.len);
     if (!out->data.data) die("malloc");
-    if (recvfrom(sock_fd, out->data.data, out->data.len, 0, NULL, NULL) == -1)
-        die("recvfrom");
+    read_stream(out->data.data, stream, out->data.len);
     return out;
 }
 
-int main() {
+static void free_question(const struct dns_question *q) {
+    free((void *)q->name);
+    free((void *)q);
+}
+
+static void free_record(const struct dns_record *r) {
+    free((void *)r->name);
+    free(r->data.data);
+    free((void *)r);
+}
+
+#if 0
+static void print_question(struct dns_question *q) {
+    printf("Question:\n"
+           "  name: %s\n"
+           "  type: %d\n"
+           "  class: %d\n",
+           q->name, q->type_, q->class_);
+}
+
+static void print_record(struct dns_record *record) {
+    printf("Record:\n"
+           "  name: %s\n"
+           "  type: %d\n"
+           "  class: %d\n"
+           "  ttl: %u\n"
+           "  data: %.*s\n",
+           record->name, record->type_, record->class_,
+           record->ttl, record->data.len, record->data.data);
+}
+#endif
+
+static void print_dotted(const uint8_t *data, int len) {
+    if (len == 0) return;
+    printf("%d", data[0]);
+    for (int i = 1; i < len; i++)
+        printf(".%d", data[i]);
+    printf("\n");
+}
+
+int main(int argc, char *argv[]) {
     char reply_buf[1024];
-    int query_size;
-    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd == -1)
-        die("socket");
+    int query_size, num_read;
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <domain_name>\n", argv[0]);
+        exit(1);
+    }
+    const char *domain_name = argv[1];
+
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(53),
+        .sin_port = htons(DNS_PORT),
     };
     if (inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr) != 1) {
         fprintf(stderr, "ERROR: can't convert address\n");
         exit(1);
     }
-    char *query = build_query("www.example.com", TYPE_A, &query_size);
+
+    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd == -1)
+        die("socket");
+
+    const char *query = build_query(domain_name, TYPE_A, &query_size);
     if (sendto(sock_fd, query, query_size, 0, (const struct sockaddr *)&addr, sizeof addr) == -1)
         die("sendto");
-    if (recvfrom(sock_fd, reply_buf, sizeof reply_buf, 0, NULL, NULL) == -1)
+    free((void *)query);
+
+    if ((num_read = recvfrom(sock_fd, reply_buf, sizeof reply_buf, 0, NULL, NULL)) == -1)
         die("recvfrom");
-    free(query);
     close(sock_fd);
+
+    Stream stream = { .pos = 0, .data = reply_buf };
+    const struct dns_header *header = parse_header(&stream);
+    const struct dns_question *question = parse_question(&stream);
+    const struct dns_record *record = parse_record(&stream);
+    print_dotted((const uint8_t *)record->data.data, record->data.len);
+    free((void *)header);
+    free_question(question);
+    free_record(record);
 }
