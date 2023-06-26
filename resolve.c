@@ -8,7 +8,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#define TYPE_A 1
+#define TYPE_A   1
+#define TYPE_NS  2
 #define CLASS_IN 1
 #define DNS_PORT 53
 
@@ -53,11 +54,20 @@ struct dns_record {
     const char *name;
 };
 
+struct dns_packet {
+    const struct dns_header *header;
+    const struct dns_question **questions;
+    const struct dns_record **answers;
+    const struct dns_record **authorities;
+    const struct dns_record **additionals;
+};
+
 static_assert(sizeof(String) == 16, "wrong size");
 static_assert(sizeof(Stream) == 16, "wrong size");
 static_assert(sizeof(struct dns_header) == 12, "wrong size");
 static_assert(sizeof(struct dns_question) == 16, "wrong size");
 static_assert(sizeof(struct dns_record) == 32, "wrong size");
+static_assert(sizeof(struct dns_packet) == 40, "wrong size");
 
 static void read_stream(void *dst, Stream *src, size_t n) {
     memcpy(dst, src->data + src->pos, n);
@@ -223,6 +233,24 @@ static const struct dns_record *parse_record(Stream *stream) {
     return out;
 }
 
+static const struct dns_packet *parse_packet(Stream *stream) {
+#define READ_RECORD(field, field_len, parse_fn) ({ \
+    out->field = malloc(out->header->field_len * sizeof(char *)); \
+    if (!out->field) die("malloc"); \
+    for (int i = 0; i < out->header->field_len; i++) \
+        out->field[i] = parse_fn(stream); \
+})
+    struct dns_packet *out = malloc(sizeof *out);
+    if (!out) die("malloc");
+    out->header = parse_header(stream);
+    READ_RECORD(questions, num_questions, parse_question);
+    READ_RECORD(answers, num_answers, parse_record);
+    READ_RECORD(authorities, num_authorities, parse_record);
+    READ_RECORD(additionals, num_additionals, parse_record);
+    return out;
+#undef READ_RECORD
+}
+
 static void free_question(const struct dns_question *q) {
     free((void *)q->name);
     free((void *)q);
@@ -232,6 +260,21 @@ static void free_record(const struct dns_record *r) {
     free((void *)r->name);
     free(r->data.data);
     free((void *)r);
+}
+
+static void free_packet(const struct dns_packet *p) {
+#define FREE_RECORD(field, field_len, free_fn) ({ \
+    for (int i = 0; i < p->header->field_len; i++) \
+        free_fn(p->field[i]); \
+    free((void *)p->field); \
+})
+    FREE_RECORD(questions, num_questions, free_question);
+    FREE_RECORD(answers, num_answers, free_record);
+    FREE_RECORD(authorities, num_authorities, free_record);
+    FREE_RECORD(additionals, num_additionals, free_record);
+    free((void *)p->header);
+    free((void *)p);
+#undef FREE_RECORD
 }
 
 #if 0
@@ -296,11 +339,7 @@ int main(int argc, char *argv[]) {
     close(sock_fd);
 
     Stream stream = { .pos = 0, .data = reply_buf };
-    const struct dns_header *header = parse_header(&stream);
-    const struct dns_question *question = parse_question(&stream);
-    const struct dns_record *record = parse_record(&stream);
-    print_dotted((const uint8_t *)record->data.data, record->data.len);
-    free((void *)header);
-    free_question(question);
-    free_record(record);
+    const struct dns_packet *packet = parse_packet(&stream);
+    print_dotted((const uint8_t *)packet->answers[0]->data.data, packet->answers[0]->data.len);
+    free_packet(packet);
 }
