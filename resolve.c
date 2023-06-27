@@ -163,7 +163,7 @@ static const char *decode_dns_name(Stream *stream) {
 static const char *build_query(const char *domain_name, int record_type, int *query_size) {
     /* TODO: make this random */
     uint16_t id = 0x8298;
-    uint16_t flags = 1 << 8;
+    uint16_t flags = 0;
     struct dns_header header = {
         .id = htons(id),
         .flags = htons(flags),
@@ -227,9 +227,14 @@ static const struct dns_record *parse_record(Stream *stream) {
         .data.len = ntohs(out->data_len),
         .name = name,
     };
-    out->data.data = malloc(out->data.len);
-    if (!out->data.data) die("malloc");
-    read_stream(out->data.data, stream, out->data.len);
+    if (out->type_ == TYPE_NS) {
+        out->data.data = (char *)decode_dns_name(stream);
+        out->data.len = strlen(out->data.data);
+    } else {
+        out->data.data = malloc(out->data.len);
+        if (!out->data.data) die("malloc");
+        read_stream(out->data.data, stream, out->data.len);
+    }
     return out;
 }
 
@@ -285,17 +290,6 @@ static void print_question(struct dns_question *q) {
            "  class: %d\n",
            q->name, q->type_, q->class_);
 }
-
-static void print_record(struct dns_record *record) {
-    printf("Record:\n"
-           "  name: %s\n"
-           "  type: %d\n"
-           "  class: %d\n"
-           "  ttl: %u\n"
-           "  data: %.*s\n",
-           record->name, record->type_, record->class_,
-           record->ttl, record->data.len, record->data.data);
-}
 #endif
 
 static void print_dotted(const uint8_t *data, int len) {
@@ -303,7 +297,30 @@ static void print_dotted(const uint8_t *data, int len) {
     printf("%d", data[0]);
     for (int i = 1; i < len; i++)
         printf(".%d", data[i]);
-    printf("\n");
+}
+
+static void print_hex(const uint8_t *data, int len) {
+    for (int i = 0; i < len; i++)
+        printf("%02x", data[i]);
+}
+
+static void print_record(const struct dns_record *record) {
+    printf("(struct dns_record){ "
+           ".name = \"%s\", "
+           ".type = %d, "
+           ".class = %d, "
+           ".ttl = %d, "
+           ".data = ",
+           record->name, record->type_, record->class_,
+           record->ttl);
+    if (record->type_ == TYPE_A) {
+        print_dotted((const uint8_t *)record->data.data, record->data.len);
+    } else if (record->type_ == TYPE_NS) {
+        printf("\"%s\"", record->data.data);
+    } else {
+        print_hex((const uint8_t *)record->data.data, record->data.len);
+    }
+    printf(" }\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -320,7 +337,7 @@ int main(int argc, char *argv[]) {
         .sin_family = AF_INET,
         .sin_port = htons(DNS_PORT),
     };
-    if (inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr) != 1) {
+    if (inet_pton(AF_INET, "198.41.0.4", &addr.sin_addr) != 1) {
         fprintf(stderr, "ERROR: can't convert address\n");
         exit(1);
     }
@@ -340,6 +357,14 @@ int main(int argc, char *argv[]) {
 
     Stream stream = { .pos = 0, .data = reply_buf };
     const struct dns_packet *packet = parse_packet(&stream);
-    print_dotted((const uint8_t *)packet->answers[0]->data.data, packet->answers[0]->data.len);
+    printf("Answers:\n");
+    for (int i = 0; i < packet->header->num_answers; i++)
+        print_record(packet->answers[i]);
+    printf("Authorities:\n");
+    for (int i = 0; i < packet->header->num_authorities; i++)
+        print_record(packet->authorities[i]);
+    printf("Additionals:\n");
+    for (int i = 0; i < packet->header->num_additionals; i++)
+        print_record(packet->additionals[i]);
     free_packet(packet);
 }
