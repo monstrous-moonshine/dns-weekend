@@ -13,6 +13,8 @@
 #define CLASS_IN 1
 #define DNS_PORT 53
 
+#define IPV4_ADDR(a, b, c, d) (((d) << 24) | ((c) << 16) | ((b) << 8) | ((a) << 0))
+
 static void die(const char *msg) {
     perror(msg);
     exit(1);
@@ -323,28 +325,15 @@ static void print_record(const struct dns_record *record) {
     printf(" }\n");
 }
 
-int main(int argc, char *argv[]) {
+const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr, int sock_fd) {
     char reply_buf[1024];
     int query_size, num_read;
-
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <domain_name>\n", argv[0]);
-        exit(1);
-    }
-    const char *domain_name = argv[1];
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port = htons(DNS_PORT),
+        .sin_addr.s_addr = ns_addr,
     };
-    if (inet_pton(AF_INET, "198.41.0.4", &addr.sin_addr) != 1) {
-        fprintf(stderr, "ERROR: can't convert address\n");
-        exit(1);
-    }
-
-    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd == -1)
-        die("socket");
 
     const char *query = build_query(domain_name, TYPE_A, &query_size);
     if (sendto(sock_fd, query, query_size, 0, (const struct sockaddr *)&addr, sizeof addr) == -1)
@@ -353,18 +342,65 @@ int main(int argc, char *argv[]) {
 
     if ((num_read = recvfrom(sock_fd, reply_buf, sizeof reply_buf, 0, NULL, NULL)) == -1)
         die("recvfrom");
-    close(sock_fd);
 
     Stream stream = { .pos = 0, .data = reply_buf };
     const struct dns_packet *packet = parse_packet(&stream);
-    printf("Answers:\n");
-    for (int i = 0; i < packet->header->num_answers; i++)
-        print_record(packet->answers[i]);
-    printf("Authorities:\n");
-    for (int i = 0; i < packet->header->num_authorities; i++)
-        print_record(packet->authorities[i]);
-    printf("Additionals:\n");
-    for (int i = 0; i < packet->header->num_additionals; i++)
-        print_record(packet->additionals[i]);
-    free_packet(packet);
+    return packet;
+}
+
+char *get_answer(const struct dns_packet *packet) {
+    for (int i = 0; i < packet->header->num_answers; i++) {
+        if (packet->answers[i]->type_ == TYPE_A)
+            return packet->answers[i]->data.data;
+    }
+    return NULL;
+}
+
+char *get_ns(const struct dns_packet *packet) {
+    for (int i = 0; i < packet->header->num_additionals; i++) {
+        if (packet->additionals[i]->type_ == TYPE_A)
+            return packet->additionals[i]->data.data;
+    }
+    return NULL;
+}
+
+void resolve(const char *domain_name) {
+    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd == -1)
+        die("socket");
+
+    in_addr_t ns_addr = IPV4_ADDR(198, 41, 0, 4);
+
+    while (1) {
+        char *data;
+        printf("Querying ");
+        print_dotted((const uint8_t *)&ns_addr, 4);
+        printf(" for '%s'\n", domain_name);
+        const struct dns_packet *packet = send_query(domain_name, ns_addr, sock_fd);
+        if ((data = get_answer(packet))) {
+            print_dotted((const uint8_t *)data, 4);
+            printf("\n");
+            free_packet(packet);
+            break;
+        } else if ((data = get_ns(packet))) {
+            memcpy(&ns_addr, data, 4);
+            free_packet(packet);
+        } else {
+            fprintf(stderr, "Something went wrong\n");
+            free_packet(packet);
+            break;
+        }
+    }
+
+    close(sock_fd);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <domain_name>\n", argv[0]);
+        exit(1);
+    }
+    const char *domain_name = argv[1];
+
+    resolve(domain_name);
 }
