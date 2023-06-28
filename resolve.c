@@ -356,7 +356,7 @@ char *get_answer(const struct dns_packet *packet) {
     return NULL;
 }
 
-char *get_ns(const struct dns_packet *packet) {
+char *get_ns_ip(const struct dns_packet *packet) {
     for (int i = 0; i < packet->header->num_additionals; i++) {
         if (packet->additionals[i]->type_ == TYPE_A)
             return packet->additionals[i]->data.data;
@@ -364,7 +364,17 @@ char *get_ns(const struct dns_packet *packet) {
     return NULL;
 }
 
-void resolve(const char *domain_name) {
+char *get_ns(const struct dns_packet *packet) {
+    for (int i = 0; i < packet->header->num_authorities; i++) {
+        if (packet->authorities[i]->type_ == TYPE_NS)
+            return packet->authorities[i]->data.data;
+    }
+    return NULL;
+}
+
+in_addr_t resolve(const char *domain_name) {
+    in_addr_t out;
+
     int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_fd == -1)
         die("socket");
@@ -378,21 +388,24 @@ void resolve(const char *domain_name) {
         printf(" for '%s'\n", domain_name);
         const struct dns_packet *packet = send_query(domain_name, ns_addr, sock_fd);
         if ((data = get_answer(packet))) {
-            print_dotted((const uint8_t *)data, 4);
-            printf("\n");
+            memcpy(&out, data, 4);
             free_packet(packet);
             break;
-        } else if ((data = get_ns(packet))) {
+        } else if ((data = get_ns_ip(packet))) {
             memcpy(&ns_addr, data, 4);
-            free_packet(packet);
+        } else if ((data = get_ns(packet))) {
+            ns_addr = resolve(data);
         } else {
             fprintf(stderr, "Something went wrong\n");
             free_packet(packet);
             break;
         }
+        free_packet(packet);
     }
 
     close(sock_fd);
+
+    return out;
 }
 
 int main(int argc, char *argv[]) {
@@ -402,5 +415,7 @@ int main(int argc, char *argv[]) {
     }
     const char *domain_name = argv[1];
 
-    resolve(domain_name);
+    in_addr_t addr = resolve(domain_name);
+    print_dotted((const uint8_t *)&addr, 4);
+    printf("\n");
 }
