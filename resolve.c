@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -69,7 +70,7 @@ static_assert(sizeof(Stream) == 16, "wrong size");
 static_assert(sizeof(struct dns_header) == 12, "wrong size");
 static_assert(sizeof(struct dns_question) == 16, "wrong size");
 static_assert(sizeof(struct dns_record) == 32, "wrong size");
-//static_assert(sizeof(struct dns_packet) == 40, "wrong size");
+static_assert(sizeof(struct dns_packet) == 48, "wrong size");
 
 static void read_stream(void *dst, Stream *src, size_t n) {
     memcpy(dst, src->data + src->pos, n);
@@ -163,8 +164,7 @@ static const char *decode_dns_name(Stream *stream) {
 }
 
 static const char *build_query(const char *domain_name, int record_type, int *query_size) {
-    /* TODO: make this random */
-    uint16_t id = 0x8298;
+    uint16_t id = random() & 0xffff;
     uint16_t flags = 0;
     struct dns_header header = {
         .id = htons(id),
@@ -405,6 +405,8 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     const char *domain_name = argv[1];
+
+    srandom(time(NULL));
 
     in_addr_t addr = resolve(domain_name);
     print_dotted((const uint8_t *)&addr, 4);
