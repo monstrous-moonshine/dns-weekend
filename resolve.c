@@ -57,7 +57,7 @@ struct dns_record {
 };
 
 struct dns_packet {
-    const struct dns_header *header;
+    struct dns_header header;
     const struct dns_question **questions;
     const struct dns_record **answers;
     const struct dns_record **authorities;
@@ -69,7 +69,7 @@ static_assert(sizeof(Stream) == 16, "wrong size");
 static_assert(sizeof(struct dns_header) == 12, "wrong size");
 static_assert(sizeof(struct dns_question) == 16, "wrong size");
 static_assert(sizeof(struct dns_record) == 32, "wrong size");
-static_assert(sizeof(struct dns_packet) == 40, "wrong size");
+//static_assert(sizeof(struct dns_packet) == 40, "wrong size");
 
 static void read_stream(void *dst, Stream *src, size_t n) {
     memcpy(dst, src->data + src->pos, n);
@@ -189,9 +189,7 @@ static const char *build_query(const char *domain_name, int record_type, int *qu
     return out;
 }
 
-static const struct dns_header *parse_header(Stream *stream) {
-    struct dns_header *out = malloc(sizeof *out);
-    if (!out) die("malloc");
+static void parse_header(Stream *stream, struct dns_header *out) {
     read_stream(out, stream, sizeof *out);
     *out = (struct dns_header){
         .id = ntohs(out->id),
@@ -201,7 +199,6 @@ static const struct dns_header *parse_header(Stream *stream) {
         .num_authorities = ntohs(out->num_authorities),
         .num_additionals = ntohs(out->num_additionals),
     };
-    return out;
 }
 
 static const struct dns_question *parse_question(Stream *stream) {
@@ -242,14 +239,14 @@ static const struct dns_record *parse_record(Stream *stream) {
 
 static const struct dns_packet *parse_packet(Stream *stream) {
 #define READ_RECORD(field, field_len, parse_fn) ({ \
-    out->field = malloc(out->header->field_len * sizeof(char *)); \
+    out->field = malloc(out->header.field_len * sizeof(char *)); \
     if (!out->field) die("malloc"); \
-    for (int i = 0; i < out->header->field_len; i++) \
+    for (int i = 0; i < out->header.field_len; i++) \
         out->field[i] = parse_fn(stream); \
 })
     struct dns_packet *out = malloc(sizeof *out);
     if (!out) die("malloc");
-    out->header = parse_header(stream);
+    parse_header(stream, &out->header);
     READ_RECORD(questions, num_questions, parse_question);
     READ_RECORD(answers, num_answers, parse_record);
     READ_RECORD(authorities, num_authorities, parse_record);
@@ -271,7 +268,7 @@ static void free_record(const struct dns_record *r) {
 
 static void free_packet(const struct dns_packet *p) {
 #define FREE_RECORD(field, field_len, free_fn) ({ \
-    for (int i = 0; i < p->header->field_len; i++) \
+    for (int i = 0; i < p->header.field_len; i++) \
         free_fn(p->field[i]); \
     free((void *)p->field); \
 })
@@ -279,7 +276,6 @@ static void free_packet(const struct dns_packet *p) {
     FREE_RECORD(answers, num_answers, free_record);
     FREE_RECORD(authorities, num_authorities, free_record);
     FREE_RECORD(additionals, num_additionals, free_record);
-    free((void *)p->header);
     free((void *)p);
 #undef FREE_RECORD
 }
@@ -306,6 +302,7 @@ static void print_hex(const uint8_t *data, int len) {
         printf("%02x", data[i]);
 }
 
+__attribute__((unused))
 static void print_record(const struct dns_record *record) {
     printf("(struct dns_record){ "
            ".name = \"%s\", "
@@ -349,7 +346,7 @@ const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr, 
 }
 
 char *get_answer(const struct dns_packet *packet) {
-    for (int i = 0; i < packet->header->num_answers; i++) {
+    for (int i = 0; i < packet->header.num_answers; i++) {
         if (packet->answers[i]->type_ == TYPE_A)
             return packet->answers[i]->data.data;
     }
@@ -357,7 +354,7 @@ char *get_answer(const struct dns_packet *packet) {
 }
 
 char *get_ns_ip(const struct dns_packet *packet) {
-    for (int i = 0; i < packet->header->num_additionals; i++) {
+    for (int i = 0; i < packet->header.num_additionals; i++) {
         if (packet->additionals[i]->type_ == TYPE_A)
             return packet->additionals[i]->data.data;
     }
@@ -365,7 +362,7 @@ char *get_ns_ip(const struct dns_packet *packet) {
 }
 
 char *get_ns(const struct dns_packet *packet) {
-    for (int i = 0; i < packet->header->num_authorities; i++) {
+    for (int i = 0; i < packet->header.num_authorities; i++) {
         if (packet->authorities[i]->type_ == TYPE_NS)
             return packet->authorities[i]->data.data;
     }
