@@ -58,10 +58,10 @@ struct dns_record {
 
 struct dns_packet {
     struct dns_header header;
-    const struct dns_question **questions;
-    const struct dns_record **answers;
-    const struct dns_record **authorities;
-    const struct dns_record **additionals;
+    struct dns_question *questions;
+    struct dns_record *answers;
+    struct dns_record *authorities;
+    struct dns_record *additionals;
 };
 
 static_assert(sizeof(String) == 16, "wrong size");
@@ -201,23 +201,18 @@ static void parse_header(Stream *stream, struct dns_header *out) {
     };
 }
 
-static const struct dns_question *parse_question(Stream *stream) {
+static void parse_question(Stream *stream, struct dns_question *out) {
     const char *name = decode_dns_name(stream);
-    struct dns_question *out = malloc(sizeof *out);
-    if (!out) die("malloc");
     read_stream(out, stream, 4);
     *out = (struct dns_question){
         .type_ = ntohs(out->type_),
         .class_ = ntohs(out->class_),
         .name = name,
     };
-    return out;
 }
 
-static const struct dns_record *parse_record(Stream *stream) {
+static void parse_record(Stream *stream, struct dns_record *out) {
     const char *name = decode_dns_name(stream);
-    struct dns_record *out = malloc(sizeof *out);
-    if (!out) die("malloc");
     read_stream(out, stream, 10);
     *out = (struct dns_record){
         .type_ = ntohs(out->type_),
@@ -234,15 +229,14 @@ static const struct dns_record *parse_record(Stream *stream) {
         if (!out->data.data) die("malloc");
         read_stream(out->data.data, stream, out->data.len);
     }
-    return out;
 }
 
 static const struct dns_packet *parse_packet(Stream *stream) {
 #define READ_RECORD(field, field_len, parse_fn) ({ \
-    out->field = malloc(out->header.field_len * sizeof(char *)); \
+    out->field = malloc(out->header.field_len * sizeof *out->field); \
     if (!out->field) die("malloc"); \
     for (int i = 0; i < out->header.field_len; i++) \
-        out->field[i] = parse_fn(stream); \
+        parse_fn(stream, &out->field[i]); \
 })
     struct dns_packet *out = malloc(sizeof *out);
     if (!out) die("malloc");
@@ -255,21 +249,21 @@ static const struct dns_packet *parse_packet(Stream *stream) {
 #undef READ_RECORD
 }
 
-static void free_question(const struct dns_question *q) {
+static void free_question(struct dns_question *q) {
     free((void *)q->name);
-    free((void *)q);
+    //free((void *)q);
 }
 
-static void free_record(const struct dns_record *r) {
+static void free_record(struct dns_record *r) {
     free((void *)r->name);
     free(r->data.data);
-    free((void *)r);
+    //free((void *)r);
 }
 
 static void free_packet(const struct dns_packet *p) {
 #define FREE_RECORD(field, field_len, free_fn) ({ \
     for (int i = 0; i < p->header.field_len; i++) \
-        free_fn(p->field[i]); \
+        free_fn(&p->field[i]); \
     free((void *)p->field); \
 })
     FREE_RECORD(questions, num_questions, free_question);
@@ -347,24 +341,24 @@ const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr, 
 
 char *get_answer(const struct dns_packet *packet) {
     for (int i = 0; i < packet->header.num_answers; i++) {
-        if (packet->answers[i]->type_ == TYPE_A)
-            return packet->answers[i]->data.data;
+        if (packet->answers[i].type_ == TYPE_A)
+            return packet->answers[i].data.data;
     }
     return NULL;
 }
 
 char *get_ns_ip(const struct dns_packet *packet) {
     for (int i = 0; i < packet->header.num_additionals; i++) {
-        if (packet->additionals[i]->type_ == TYPE_A)
-            return packet->additionals[i]->data.data;
+        if (packet->additionals[i].type_ == TYPE_A)
+            return packet->additionals[i].data.data;
     }
     return NULL;
 }
 
 char *get_ns(const struct dns_packet *packet) {
     for (int i = 0; i < packet->header.num_authorities; i++) {
-        if (packet->authorities[i]->type_ == TYPE_NS)
-            return packet->authorities[i]->data.data;
+        if (packet->authorities[i].type_ == TYPE_NS)
+            return packet->authorities[i].data.data;
     }
     return NULL;
 }
