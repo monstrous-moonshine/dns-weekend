@@ -9,12 +9,16 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#define TYPE_A   1
-#define TYPE_NS  2
-#define CLASS_IN 1
-#define DNS_PORT 53
+#define TYPE_A     1
+#define TYPE_NS    2
+#define TYPE_CNAME 5
+#define CLASS_IN   1
+#define DNS_PORT   53
 
 #define IPV4_ADDR(a, b, c, d) (((d) << 24) | ((c) << 16) | ((b) << 8) | ((a) << 0))
+#define ROOT_NS IPV4_ADDR(198, 41, 0, 4)
+
+#define _cleanup_(f) __attribute__((cleanup(f)))
 
 static void die(const char *msg) {
     perror(msg);
@@ -221,7 +225,7 @@ static void parse_record(Stream *stream, struct dns_record *out) {
         .data.len = ntohs(out->data_len),
         .name = name,
     };
-    if (out->type_ == TYPE_NS) {
+    if (out->type_ == TYPE_NS || out->type_ == TYPE_CNAME) {
         out->data.data = (char *)decode_dns_name(stream);
         out->data.len = strlen(out->data.data);
     } else {
@@ -260,29 +264,31 @@ static void free_record(struct dns_record *r) {
     //free((void *)r);
 }
 
-static void free_packet(const struct dns_packet *p) {
+static void free_packetp(const struct dns_packet **p) {
 #define FREE_RECORD(field, field_len, free_fn) ({ \
-    for (int i = 0; i < p->header.field_len; i++) \
-        free_fn(&p->field[i]); \
-    free((void *)p->field); \
+    for (int i = 0; i < (*p)->header.field_len; i++) \
+        free_fn(&(*p)->field[i]); \
+    free((void *)(*p)->field); \
 })
     FREE_RECORD(questions, num_questions, free_question);
     FREE_RECORD(answers, num_answers, free_record);
     FREE_RECORD(authorities, num_authorities, free_record);
     FREE_RECORD(additionals, num_additionals, free_record);
-    free((void *)p);
+    free((void *)(*p));
 #undef FREE_RECORD
 }
 
-#if 0
-static void print_question(struct dns_question *q) {
-    printf("Question:\n"
-           "  name: %s\n"
-           "  type: %d\n"
-           "  class: %d\n",
+static void freep(char **ptr) {
+    free(*ptr);
+}
+
+static void print_question(const struct dns_question *q) {
+    printf("(struct dns_question){ "
+           ".name = \"%s\", "
+           ".type = %d, "
+           ".class = %d }\n",
            q->name, q->type_, q->class_);
 }
-#endif
 
 static void print_dotted(const uint8_t *data, int len) {
     if (len == 0) return;
@@ -296,7 +302,6 @@ static void print_hex(const uint8_t *data, int len) {
         printf("%02x", data[i]);
 }
 
-__attribute__((unused))
 static void print_record(const struct dns_record *record) {
     printf("(struct dns_record){ "
            ".name = \"%s\", "
@@ -308,7 +313,7 @@ static void print_record(const struct dns_record *record) {
            record->ttl);
     if (record->type_ == TYPE_A) {
         print_dotted((const uint8_t *)record->data.data, record->data.len);
-    } else if (record->type_ == TYPE_NS) {
+    } else if (record->type_ == TYPE_NS || record->type_ == TYPE_CNAME) {
         printf("\"%s\"", record->data.data);
     } else {
         print_hex((const uint8_t *)record->data.data, record->data.len);
@@ -316,9 +321,27 @@ static void print_record(const struct dns_record *record) {
     printf(" }\n");
 }
 
-const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr, int sock_fd) {
+static void print_packet(const struct dns_packet *packet) {
+#define PRINT_RECORD(print_fn, field, field_len, field_type) ({ \
+    printf(field_type); \
+    for (int i = 0; i < packet->header.field_len; i++) { \
+        print_fn(&packet->field[i]); \
+    } \
+})
+    PRINT_RECORD(print_question, questions, num_questions, "Questions:\n");
+    PRINT_RECORD(print_record, answers, num_answers, "Answers:\n");
+    PRINT_RECORD(print_record, authorities, num_authorities, "Authorities:\n");
+    PRINT_RECORD(print_record, additionals, num_additionals, "Additionals:\n");
+#undef PRINT_RECORD
+}
+
+const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr) {
     char reply_buf[1024];
     int query_size, num_read;
+
+    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd == -1)
+        die("socket");
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -333,9 +356,11 @@ const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr, 
 
     if ((num_read = recvfrom(sock_fd, reply_buf, sizeof reply_buf, 0, NULL, NULL)) == -1)
         die("recvfrom");
+    close(sock_fd);
 
     Stream stream = { .pos = 0, .data = reply_buf };
     const struct dns_packet *packet = parse_packet(&stream);
+
     return packet;
 }
 
@@ -363,40 +388,45 @@ char *get_ns(const struct dns_packet *packet) {
     return NULL;
 }
 
+char *get_cname(const struct dns_packet *packet) {
+    for (int i = 0; i < packet->header.num_answers; i++) {
+        if (packet->answers[i].type_ == TYPE_CNAME)
+            return packet->answers[i].data.data;
+    }
+    return NULL;
+}
+
 in_addr_t resolve(const char *domain_name) {
-    in_addr_t out;
-
-    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd == -1)
-        die("socket");
-
-    in_addr_t ns_addr = IPV4_ADDR(198, 41, 0, 4);
+    _cleanup_(freep) char *cname = NULL;
+    in_addr_t ns_addr = ROOT_NS;
 
     while (1) {
-        char *data;
+        char *data = NULL;
+        _cleanup_(free_packetp) const struct dns_packet *packet = NULL;
+
         printf("Querying ");
         print_dotted((const uint8_t *)&ns_addr, 4);
         printf(" for '%s'\n", domain_name);
-        const struct dns_packet *packet = send_query(domain_name, ns_addr, sock_fd);
+        packet = send_query(domain_name, ns_addr);
         if ((data = get_answer(packet))) {
+            in_addr_t out;
             memcpy(&out, data, 4);
-            free_packet(packet);
-            break;
+            return out;
+        } else if ((data = get_cname(packet))) {
+            free(cname);
+            cname = strdup(data);
+            domain_name = cname;
+            ns_addr = ROOT_NS;
         } else if ((data = get_ns_ip(packet))) {
             memcpy(&ns_addr, data, 4);
         } else if ((data = get_ns(packet))) {
             ns_addr = resolve(data);
         } else {
-            fprintf(stderr, "Something went wrong\n");
-            free_packet(packet);
-            break;
+            fprintf(stderr, "ERROR: no recognized DNS record found in packet.\n");
+            print_packet(packet);
+            return -1;
         }
-        free_packet(packet);
     }
-
-    close(sock_fd);
-
-    return out;
 }
 
 int main(int argc, char *argv[]) {
