@@ -31,6 +31,7 @@ typedef struct {
 } String;
 
 typedef struct {
+    uint16_t len;
     uint16_t pos;
     char *data;
 } Stream;
@@ -132,6 +133,7 @@ static const char *decode_compressed_name(Stream *stream, uint8_t field_len) {
     read_stream(&next_byte, stream, 1);
     uint16_t ptr = ((field_len & 0x3f) << 8) | next_byte;
     uint16_t cur = tell_stream(stream);
+    if (ptr == cur) return NULL;
     seek_stream(stream, ptr);
     const char *out = decode_dns_name(stream);
     seek_stream(stream, cur);
@@ -163,7 +165,7 @@ static const char *decode_dns_name(Stream *stream) {
         }
         read_stream(&field_len, stream, 1);
     }
-    out[prev_len - 1] = '\0';
+    if (prev_len > 0) out[prev_len - 1] = '\0';
     return out;
 }
 
@@ -184,7 +186,7 @@ static const char *build_query(const char *domain_name, int record_type, int *qu
     int size = sizeof header + name_len + 4;
     char *out = malloc(size);
     if (!out) die("malloc");
-    Stream stream = { .pos = 0, .data = out };
+    Stream stream = { .len = size, .pos = 0, .data = out };
     write_stream(&stream, &header, sizeof header);
     write_stream(&stream, name, name_len);
     write_stream(&stream, &question, 4);
@@ -358,7 +360,7 @@ const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr) 
         die("recvfrom");
     close(sock_fd);
 
-    Stream stream = { .pos = 0, .data = reply_buf };
+    Stream stream = { .len = num_read, .pos = 0, .data = reply_buf };
     const struct dns_packet *packet = parse_packet(&stream);
 
     return packet;
