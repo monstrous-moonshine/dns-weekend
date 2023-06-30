@@ -238,49 +238,47 @@ static void parse_record(Stream *stream, struct dns_record *out) {
 }
 
 static const struct dns_packet *parse_packet(Stream *stream) {
-#define READ_RECORD(field, field_len, parse_fn) ({ \
+#define READ_RECORD(parse_fn, field, field_len) ({                   \
     out->field = malloc(out->header.field_len * sizeof *out->field); \
-    if (!out->field) die("malloc"); \
-    for (int i = 0; i < out->header.field_len; i++) \
-        parse_fn(stream, &out->field[i]); \
+    if (!out->field) die("malloc");                                  \
+    for (int i = 0; i < out->header.field_len; i++)                  \
+        parse_fn(stream, &out->field[i]);                            \
 })
     struct dns_packet *out = malloc(sizeof *out);
     if (!out) die("malloc");
     parse_header(stream, &out->header);
-    READ_RECORD(questions, num_questions, parse_question);
-    READ_RECORD(answers, num_answers, parse_record);
-    READ_RECORD(authorities, num_authorities, parse_record);
-    READ_RECORD(additionals, num_additionals, parse_record);
+    READ_RECORD(parse_question, questions, num_questions);
+    READ_RECORD(parse_record, answers, num_answers);
+    READ_RECORD(parse_record, authorities, num_authorities);
+    READ_RECORD(parse_record, additionals, num_additionals);
     return out;
 #undef READ_RECORD
 }
 
 static void free_question(struct dns_question *q) {
     free((void *)q->name);
-    //free((void *)q);
 }
 
 static void free_record(struct dns_record *r) {
     free((void *)r->name);
     free(r->data.data);
-    //free((void *)r);
 }
 
 static void free_packetp(const struct dns_packet **p) {
-#define FREE_RECORD(field, field_len, free_fn) ({ \
+#define FREE_RECORD(free_fn, field, field_len) ({    \
     for (int i = 0; i < (*p)->header.field_len; i++) \
-        free_fn(&(*p)->field[i]); \
-    free((void *)(*p)->field); \
+        free_fn(&(*p)->field[i]);                    \
+    free((void *)(*p)->field);                       \
 })
-    FREE_RECORD(questions, num_questions, free_question);
-    FREE_RECORD(answers, num_answers, free_record);
-    FREE_RECORD(authorities, num_authorities, free_record);
-    FREE_RECORD(additionals, num_additionals, free_record);
+    FREE_RECORD(free_question, questions, num_questions);
+    FREE_RECORD(free_record, answers, num_answers);
+    FREE_RECORD(free_record, authorities, num_authorities);
+    FREE_RECORD(free_record, additionals, num_additionals);
     free((void *)(*p));
 #undef FREE_RECORD
 }
 
-static void freep(char **ptr) {
+static void free_charp(char **ptr) {
     free(*ptr);
 }
 
@@ -324,20 +322,20 @@ static void print_record(const struct dns_record *record) {
 }
 
 static void print_packet(const struct dns_packet *packet) {
-#define PRINT_RECORD(print_fn, field, field_len, field_type) ({ \
-    printf(field_type); \
-    for (int i = 0; i < packet->header.field_len; i++) { \
-        print_fn(&packet->field[i]); \
-    } \
+#define PRINT_RECORD(print_fn, field, field_len, field_header) ({ \
+    printf("%s:\n", field_header);                                \
+    for (int i = 0; i < packet->header.field_len; i++) {          \
+        print_fn(&packet->field[i]);                              \
+    }                                                             \
 })
-    PRINT_RECORD(print_question, questions, num_questions, "Questions:\n");
-    PRINT_RECORD(print_record, answers, num_answers, "Answers:\n");
-    PRINT_RECORD(print_record, authorities, num_authorities, "Authorities:\n");
-    PRINT_RECORD(print_record, additionals, num_additionals, "Additionals:\n");
+    PRINT_RECORD(print_question, questions, num_questions, "Questions");
+    PRINT_RECORD(print_record, answers, num_answers, "Answers");
+    PRINT_RECORD(print_record, authorities, num_authorities, "Authorities");
+    PRINT_RECORD(print_record, additionals, num_additionals, "Additionals");
 #undef PRINT_RECORD
 }
 
-const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr) {
+static const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr) {
     char reply_buf[1024];
     int query_size, num_read;
 
@@ -352,13 +350,14 @@ const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr) 
     };
 
     const char *query = build_query(domain_name, TYPE_A, &query_size);
-    if (sendto(sock_fd, query, query_size, 0, (const struct sockaddr *)&addr, sizeof addr) == -1)
+    if (sendto(sock_fd, query, query_size, 0, (const struct sockaddr *)&addr, sizeof addr) != query_size)
         die("sendto");
     free((void *)query);
 
     if ((num_read = recvfrom(sock_fd, reply_buf, sizeof reply_buf, 0, NULL, NULL)) == -1)
         die("recvfrom");
-    close(sock_fd);
+    if (close(sock_fd) == -1)
+        die("close");
 
     Stream stream = { .len = num_read, .pos = 0, .data = reply_buf };
     const struct dns_packet *packet = parse_packet(&stream);
@@ -366,40 +365,24 @@ const struct dns_packet *send_query(const char *domain_name, in_addr_t ns_addr) 
     return packet;
 }
 
-char *get_answer(const struct dns_packet *packet) {
-    for (int i = 0; i < packet->header.num_answers; i++) {
-        if (packet->answers[i].type_ == TYPE_A)
-            return packet->answers[i].data.data;
-    }
-    return NULL;
+#define DEFINE_GETTER(fn_name, field, field_len, field_type)  \
+static char *get_##fn_name(const struct dns_packet *packet) { \
+    for (int i = 0; i < packet->header.field_len; i++) {      \
+        if (packet->field[i].type_ == field_type)             \
+            return packet->field[i].data.data;                \
+    }                                                         \
+    return NULL;                                              \
 }
 
-char *get_ns_ip(const struct dns_packet *packet) {
-    for (int i = 0; i < packet->header.num_additionals; i++) {
-        if (packet->additionals[i].type_ == TYPE_A)
-            return packet->additionals[i].data.data;
-    }
-    return NULL;
-}
+DEFINE_GETTER(answer, answers, num_answers, TYPE_A)
+DEFINE_GETTER(cname, answers, num_answers, TYPE_CNAME)
+DEFINE_GETTER(ns_ip, additionals, num_additionals, TYPE_A)
+DEFINE_GETTER(ns, authorities, num_authorities, TYPE_NS)
 
-char *get_ns(const struct dns_packet *packet) {
-    for (int i = 0; i < packet->header.num_authorities; i++) {
-        if (packet->authorities[i].type_ == TYPE_NS)
-            return packet->authorities[i].data.data;
-    }
-    return NULL;
-}
+#undef DEFINE_GETTER
 
-char *get_cname(const struct dns_packet *packet) {
-    for (int i = 0; i < packet->header.num_answers; i++) {
-        if (packet->answers[i].type_ == TYPE_CNAME)
-            return packet->answers[i].data.data;
-    }
-    return NULL;
-}
-
-in_addr_t resolve(const char *domain_name) {
-    _cleanup_(freep) char *cname = NULL;
+static in_addr_t resolve(const char *domain_name) {
+    _cleanup_(free_charp) char *cname = NULL;
     in_addr_t ns_addr = ROOT_NS;
 
     while (1) {
@@ -408,7 +391,7 @@ in_addr_t resolve(const char *domain_name) {
 
         printf("Querying ");
         print_dotted((const uint8_t *)&ns_addr, 4);
-        printf(" for '%s'\n", domain_name);
+        printf(" for %s\n", domain_name);
         packet = send_query(domain_name, ns_addr);
         if ((data = get_answer(packet))) {
             in_addr_t out;
